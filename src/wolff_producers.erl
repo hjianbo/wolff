@@ -413,7 +413,7 @@ recover_dynamic_topic(BaseDir, EscapedPrefix, Segment0) ->
   case Segment of
     <<EscapedPrefix:(byte_size(EscapedPrefix))/binary, EscapedTopic/binary>> ->
       Path = filename:join(BaseDir, Segment0),
-      case {has_replayq_partition_dir(Path), replayq_unescape(EscapedTopic)} of
+      case {has_replayq_pending_messages(Path), replayq_unescape(EscapedTopic)} of
         {true, {ok, Topic}} when Topic =/= <<>> -> {true, Topic};
         _ -> false
       end;
@@ -421,20 +421,85 @@ recover_dynamic_topic(BaseDir, EscapedPrefix, Segment0) ->
       false
   end.
 
-has_replayq_partition_dir(Path) ->
+has_replayq_pending_messages(Path) ->
   case file:list_dir(Path) of
     {ok, Partitions} ->
-      lists:any(fun(Partition) -> is_replayq_partition_dir(Path, Partition) end, Partitions);
+      lists:any(fun(Partition) -> partition_has_replayq_pending_messages(Path, Partition) end, Partitions);
     {error, _} ->
       false
   end.
 
-is_replayq_partition_dir(Path, Partition) ->
+partition_has_replayq_pending_messages(Path, Partition) ->
   case string:to_integer(Partition) of
     {Int, []} when Int >= 0 ->
-      filelib:is_dir(filename:join(Path, Partition));
+      replayq_dir_has_pending_messages(filename:join(Path, Partition));
     _ ->
       false
+  end.
+
+replayq_dir_has_pending_messages(Dir) ->
+  case filelib:is_dir(Dir) of
+    true ->
+      Commit = replayq_commit(Dir),
+      lists:any(
+        fun({Segno, File}) ->
+          replayq_segment_has_pending_messages(Dir, Segno, File, Commit)
+        end,
+        replayq_segments(Dir)
+      );
+    false ->
+      false
+  end.
+
+replayq_segments(Dir) ->
+  case file:list_dir(Dir) of
+    {ok, Files} ->
+      lists:filtermap(
+        fun(File) ->
+          case replayq_segment_no(File) of
+            {ok, Segno} -> {true, {Segno, filename:join(Dir, File)}};
+            error -> false
+          end
+        end,
+        Files
+      );
+    {error, _} ->
+      []
+  end.
+
+replayq_segment_no(File) ->
+  case filename:extension(File) of
+    ".replaylog" ->
+      case string:to_integer(filename:rootname(File, ".replaylog")) of
+        {Segno, []} when Segno > 0 -> {ok, Segno};
+        _ -> error
+      end;
+    _ ->
+      error
+  end.
+
+replayq_segment_has_pending_messages(_Dir, _Segno, File, no_commit) ->
+  file_has_bytes(File);
+replayq_segment_has_pending_messages(_Dir, Segno, _File, {CommittedSegno, _CommittedId})
+  when Segno < CommittedSegno ->
+  false;
+replayq_segment_has_pending_messages(Dir, Segno, _File, {Segno, CommittedId}) ->
+  length(replayq:do_read_items(Dir, Segno)) > CommittedId;
+replayq_segment_has_pending_messages(_Dir, _Segno, File, {_CommittedSegno, _CommittedId}) ->
+  file_has_bytes(File).
+
+replayq_commit(Dir) ->
+  case file:consult(filename:join(Dir, "COMMIT")) of
+    {ok, [#{segno := Segno, id := Id}]} when is_integer(Segno), is_integer(Id) ->
+      {Segno, Id};
+    _ ->
+      no_commit
+  end.
+
+file_has_bytes(File) ->
+  case filelib:file_size(File) of
+    Size when is_integer(Size), Size > 0 -> true;
+    _ -> false
   end.
 
 handle_info(?refresh_partition_count, #{refresh_tref := Tref, config := Config} = St) ->
