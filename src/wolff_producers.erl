@@ -73,6 +73,7 @@
 -type config_key() :: name |
                       partitioner |
                       partition_count_refresh_interval_seconds |
+                      recover_dynamic_topics |
                       reinit_max_attempts |
                       wolff_producer:config_key().
 -type config() :: #{config_key() => term()}.
@@ -360,13 +361,7 @@ pick_partition(Count, first_key_dispatch, [#{key := Key} | _]) ->
 init({ClientId, ?NS_TOPIC(_, Topic) = ID, Config}) ->
   process_flag(trap_exit, true),
   self() ! ?rediscover_client,
-  Status =
-    case Topic =:= ?DYNAMIC of
-      true ->
-        #{};
-      false ->
-        #{Topic => ?not_initialized(0, pending)}
-    end,
+  Status = init_topics_status(ClientId, Topic, Config),
   {ok, #{client_id => ClientId,
          client_pid => false,
          config => Config,
@@ -375,6 +370,137 @@ init({ClientId, ?NS_TOPIC(_, Topic) = ID, Config}) ->
          refresh_tref => start_partition_refresh_timer(Config),
          ?reinit_tref => ?no_timer
         }}.
+
+init_topics_status(ClientId, ?DYNAMIC, Config) ->
+  case maps:get(recover_dynamic_topics, Config, false) of
+    true ->
+      maps:from_list([{Topic, ?not_initialized(0, replayq_recovery)}
+                      || Topic <- recover_dynamic_topics(ClientId, Config)]);
+    false ->
+      #{}
+  end;
+init_topics_status(_ClientId, Topic, _Config) ->
+  #{Topic => ?not_initialized(0, pending)}.
+
+recover_dynamic_topics(ClientId, Config) ->
+  case maps:get(replayq_dir, Config, false) of
+    false ->
+      [];
+    BaseDir ->
+      NS = replayq_path_ns(ClientId, Config),
+      EscapedPrefix = <<(replayq_escape(NS))/binary, $_>>,
+      case file:list_dir(BaseDir) of
+        {ok, Segments} ->
+          lists:filtermap(
+            fun(Segment) ->
+              recover_dynamic_topic(BaseDir, EscapedPrefix, Segment)
+            end,
+            Segments
+          );
+        {error, _} ->
+          []
+      end
+  end.
+
+replayq_path_ns(ClientId, Config) ->
+  case maps:find(group, Config) of
+    {ok, Group} when is_binary(Group) -> Group;
+    _ -> ClientId
+  end.
+
+recover_dynamic_topic(BaseDir, EscapedPrefix, Segment0) ->
+  Segment = iolist_to_binary(Segment0),
+  case Segment of
+    <<EscapedPrefix:(byte_size(EscapedPrefix))/binary, EscapedTopic/binary>> ->
+      Path = filename:join(BaseDir, Segment0),
+      case {has_replayq_pending_messages(Path), replayq_unescape(EscapedTopic)} of
+        {true, {ok, Topic}} when Topic =/= <<>> -> {true, Topic};
+        _ -> false
+      end;
+    _ ->
+      false
+  end.
+
+has_replayq_pending_messages(Path) ->
+  case file:list_dir(Path) of
+    {ok, Partitions} ->
+      lists:any(fun(Partition) -> partition_has_replayq_pending_messages(Path, Partition) end, Partitions);
+    {error, _} ->
+      false
+  end.
+
+partition_has_replayq_pending_messages(Path, Partition) ->
+  case string:to_integer(Partition) of
+    {Int, []} when Int >= 0 ->
+      replayq_dir_has_pending_messages(filename:join(Path, Partition));
+    _ ->
+      false
+  end.
+
+replayq_dir_has_pending_messages(Dir) ->
+  case filelib:is_dir(Dir) of
+    true ->
+      Commit = replayq_commit(Dir),
+      lists:any(
+        fun({Segno, File}) ->
+          replayq_segment_has_pending_messages(Dir, Segno, File, Commit)
+        end,
+        replayq_segments(Dir)
+      );
+    false ->
+      false
+  end.
+
+replayq_segments(Dir) ->
+  case file:list_dir(Dir) of
+    {ok, Files} ->
+      lists:filtermap(
+        fun(File) ->
+          case replayq_segment_no(File) of
+            {ok, Segno} -> {true, {Segno, filename:join(Dir, File)}};
+            error -> false
+          end
+        end,
+        Files
+      );
+    {error, _} ->
+      []
+  end.
+
+replayq_segment_no(File) ->
+  case filename:extension(File) of
+    ".replaylog" ->
+      case string:to_integer(filename:rootname(File, ".replaylog")) of
+        {Segno, []} when Segno > 0 -> {ok, Segno};
+        _ -> error
+      end;
+    _ ->
+      error
+  end.
+
+replayq_segment_has_pending_messages(_Dir, _Segno, File, no_commit) ->
+  file_has_bytes(File);
+replayq_segment_has_pending_messages(_Dir, Segno, _File, {CommittedSegno, _CommittedId})
+  when Segno < CommittedSegno ->
+  false;
+replayq_segment_has_pending_messages(Dir, Segno, _File, {Segno, CommittedId}) ->
+  length(replayq:do_read_items(Dir, Segno)) > CommittedId;
+replayq_segment_has_pending_messages(_Dir, _Segno, File, {_CommittedSegno, _CommittedId}) ->
+  file_has_bytes(File).
+
+replayq_commit(Dir) ->
+  case file:consult(filename:join(Dir, "COMMIT")) of
+    {ok, [#{segno := Segno, id := Id}]} when is_integer(Segno), is_integer(Id) ->
+      {Segno, Id};
+    _ ->
+      no_commit
+  end.
+
+file_has_bytes(File) ->
+  case filelib:file_size(File) of
+    Size when is_integer(Size), Size > 0 -> true;
+    _ -> false
+  end.
 
 handle_info(?refresh_partition_count, #{refresh_tref := Tref, config := Config} = St) ->
     ok = ensure_timer_cancelled(Tref, ?partition_count_refresh_interval_seconds),
@@ -898,3 +1024,64 @@ resolve_ns(_ClientId, Group) when is_binary(Group) ->
 
 now_ts() ->
   erlang:system_time(millisecond).
+
+%% Keep this in sync with wolff_producer:escape/1 without exporting another module API.
+replayq_escape(Str) ->
+    NormalizedStr = unicode:characters_to_nfd_list(Str),
+    iolist_to_binary(replayq_escape_uri(NormalizedStr)).
+
+replayq_escape_uri([C | Cs]) when C >= $a, C =< $z ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C | Cs]) when C >= $A, C =< $Z ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C | Cs]) when C >= $0, C =< $9 ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C = $. | Cs]) ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C = $- | Cs]) ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C = $_ | Cs]) ->
+    [C | replayq_escape_uri(Cs)];
+replayq_escape_uri([C | Cs]) when C > 16#7f ->
+    replayq_escape_byte(((C band 16#c0) bsr 6) + 16#c0)
+        ++ replayq_escape_byte(C band 16#3f + 16#80)
+        ++ replayq_escape_uri(Cs);
+replayq_escape_uri([C | Cs]) ->
+    replayq_escape_byte(C) ++ replayq_escape_uri(Cs);
+replayq_escape_uri([]) ->
+    [].
+
+replayq_escape_byte(C) when C >= 0, C =< 255 ->
+    [$=, replayq_hex_digit(C bsr 4), replayq_hex_digit(C band 15)].
+
+replayq_hex_digit(N) when N >= 0, N =< 9 ->
+    N + $0;
+replayq_hex_digit(N) when N > 9, N =< 15 ->
+    N + $a - 10.
+
+replayq_unescape(Str) ->
+    try
+        {ok, iolist_to_binary(lists:reverse(replayq_unescape(binary_to_list(Str), [])))}
+    catch
+        error:bad_replayq_escape ->
+            error
+    end.
+
+replayq_unescape([$=, H1, H2 | Rest], Acc) ->
+    Byte = replayq_hex_value(H1) * 16 + replayq_hex_value(H2),
+    replayq_unescape(Rest, [Byte | Acc]);
+replayq_unescape([$= | _], _Acc) ->
+    error(bad_replayq_escape);
+replayq_unescape([C | Rest], Acc) ->
+    replayq_unescape(Rest, [C | Acc]);
+replayq_unescape([], Acc) ->
+    Acc.
+
+replayq_hex_value(C) when C >= $0, C =< $9 ->
+    C - $0;
+replayq_hex_value(C) when C >= $a, C =< $f ->
+    C - $a + 10;
+replayq_hex_value(C) when C >= $A, C =< $F ->
+    C - $A + 10;
+replayq_hex_value(_) ->
+    error(bad_replayq_escape).
